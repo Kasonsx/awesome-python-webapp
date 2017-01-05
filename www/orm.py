@@ -1,6 +1,6 @@
 # -*- coding:utf-8 -*-
 import aiomysql
-import logging，asyncio
+import logging,asyncio
 # 记录SQL语句
 def log(sql,args=()):
 	logging.info('SQL:%s' % sql)
@@ -26,6 +26,13 @@ async def create_pool(loop, **kw):
 		loop=loop
 		)
 
+#销毁连接池
+async def destory_pool():
+	global __pool
+	if __pool is not None:
+		__pool.close()
+		await __pool.wait_closed()
+
 # SELECT操作
 async def select(sql,args,size=None):
 	log(sql,args)
@@ -45,7 +52,7 @@ async def select(sql,args,size=None):
 		logging.info('rows returned: %s' % len(rs))
 		return rs
 # Insert,Update,Delete操作
-async def execute(sql,args):
+async def execute(sql,args,autocommit=True):
 	log(sql)
 	# with (await __pool) as conn:
 	async with __pool.get() as conn:
@@ -69,8 +76,6 @@ def create_args_string(num):
 		L.append('?')
 	return ', '.join(L)
 # ===================ORM===========================
-from orm import Model, StringField, IntegerField
-
 class Field(object):
 
 	def __init__(self, name, colume_type, primary_key, default):
@@ -78,7 +83,7 @@ class Field(object):
 		self.colume_type = colume_type
 		self.primary_key = primary_key
 		self.default = default
-
+	# default参数可以让ORM自己填入缺省值，并且缺省值可以作为函数对象传入，在调用save()时自动计算
 	def __str__(self):
 		return '<%s,%s:%s>' %(self.__class__.__name__, self.colume_type, self.name)
 
@@ -133,15 +138,15 @@ class ModelMetaclass(type):
 			attrs.pop(k)
 		escaped_fields = list(map(lambda f:'`%s`' %f, fields))
 		attrs['__mappings__'] = mappings # 保存属性和列的映射关系
-        attrs['__table__'] = tableName
-        attrs['__primary_key__'] = primaryKey # 主键属性名
-        attrs['__fields__'] = fields # 除主键外的属性名
-        # 构造默认的SELECT, INSERT, UPDATE和DELETE语句:
-        attrs['__select__'] = 'select `%s`, %s from `%s`' % (primaryKey, ', '.join(escaped_fields), tableName)
-        attrs['__insert__'] = 'insert into `%s` (%s, `%s`) values (%s)' % (tableName, ', '.join(escaped_fields), primaryKey, create_args_string(len(escaped_fields) + 1))
-        attrs['__update__'] = 'update `%s` set %s where `%s`=?' % (tableName, ', '.join(map(lambda f: '`%s`=?' % (mappings.get(f).name or f), fields)), primaryKey)
-        attrs['__delete__'] = 'delete from `%s` where `%s`=?' % (tableName, primaryKey)
-        return type.__new__(cls, name, bases, attrs)
+		attrs['__table__'] = tableName
+		attrs['__primary_key__'] = primaryKey #主键属性名
+		attrs['__fields__'] = fields # 除主键外的属性名
+		# 构造默认的SELECT, INSERT, UPDATE和DELETE语句:
+		attrs['__select__'] = 'select `%s`, %s from `%s`' % (primaryKey, ', '.join(escaped_fields), tableName)
+		attrs['__insert__'] = 'insert into `%s` (%s, `%s`) values (%s)' % (tableName, ', '.join(escaped_fields), primaryKey, create_args_string(len(escaped_fields) + 1))
+		attrs['__update__'] = 'update `%s` set %s where `%s`=?' % (tableName, ', '.join(map(lambda f: '`%s`=?' % (mappings.get(f).name or f), fields)), primaryKey)
+		attrs['__delete__'] = 'delete from `%s` where `%s`=?' % (tableName, primaryKey)
+		return type.__new__(cls, name, bases, attrs)
 
 # 定义所有ORM映射的基类Model
 # 继承dict，实现__getattr__和__setattr__方法可以直接↓
@@ -224,7 +229,7 @@ class Model(dict, metaclass=ModelMetaclass):
 
 	async def save(self):
 		args = list(map(self.getValueOrDefault, self.__fields__))
-		srgs.append(self.getValueOrDefault(self.__primary_key__))
+		args.append(self.getValueOrDefault(self.__primary_key__))
 		rows = await execute(self.__insert__, args)
 		if rows != 1:
 			logging.warn('failed to insert record:affected rows:%s' % rows)
@@ -245,16 +250,4 @@ class Model(dict, metaclass=ModelMetaclass):
 		if rows != 1:
 			logging.warn('failed to remove by primary key: affected rows: %s' % rows)
 
-
-class User(Model):
-	__table__ = 'users'
-	id = IntegerField(primary_key=True)
-	name = StringField()
-	# id和name是User类的属性，不是实例的属性
-# 创建实例:
-# user = User(id=123, name='Michael')
-# 存入数据库:
-# user.insert()
-# 查询所有User对象:
-# users = User.findAll()
 
