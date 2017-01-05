@@ -1,7 +1,7 @@
 # -*- coding:utf-8 -*-
 import aiomysql
 import logging，asyncio
-
+# 记录SQL语句
 def log(sql,args=()):
 	logging.info('SQL:%s' % sql)
 # =================数据库操作======================
@@ -30,35 +30,49 @@ async def create_pool(loop, **kw):
 async def select(sql,args,size=None):
 	log(sql,args)
 	global __pool
-	with (await __pool) as conn:
-		cur = await conn.cursor(aiomysql.DictCursor)
+	# with (await __pool) as conn:
+	async with __pool.get() as conn:
+		#cur = await conn.cursor(aiomysql.DictCursor)
+		async with conn.cursor(aiomysql.DictCursor) as cur:
 		# SQL语句的占位符是?，而MySQL的占位符是%s，替换
-		await cur.execute(sql.replace('?','%s'), args or ())
-		if size:
-			# 获取最多指定数量的记录
-			rs = await cur.fetchmany(size)
-		else:
-			# 获取所有记录
-			rs = await cur.fetchall()
-		await cur.close()
+			await cur.execute(sql.replace('?','%s'), args or ())
+			if size:
+				# 获取最多指定数量的记录
+				rs = await cur.fetchmany(size)
+			else:
+				# 获取所有记录
+				rs = await cur.fetchall()
 		logging.info('rows returned: %s' % len(rs))
 		return rs
 # Insert,Update,Delete操作
 async def execute(sql,args):
 	log(sql)
-	with (await __pool) as conn:
+	# with (await __pool) as conn:
+	async with __pool.get() as conn:
+		if not autocommit:
+			await conn.begin()
 		try:
-			cur = await conn.cursor()
-			await cur.execute(sql.replace('?','%s'),args)
-			affected = cur.rowcount
-			await cur.close()
+			# cur = await conn.cursor()
+			async with conn.cursor(aiomysql.DictCursor) as cur:
+				await cur.execute(sql.replace('?','%s'),args)
+				affected = cur.rowcount
+			if not autocommit:
+				await conn.commit()
 		except BaseException as e:
+			if not autocommit:
+				await conn.rollback()
 			raise
 		return affected
-
+def create_args_string(num):
+	L = []
+	for n in range(num):
+		L.append('?')
+	return ', '.join(L)
 # ===================ORM===========================
 from orm import Model, StringField, IntegerField
+
 class Field(object):
+
 	def __init__(self, name, colume_type, primary_key, default):
 		self.name = name
 		self.colume_type = colume_type
@@ -67,10 +81,27 @@ class Field(object):
 
 	def __str__(self):
 		return '<%s,%s:%s>' %(self.__class__.__name__, self.colume_type, self.name)
+
 # 映射varchar的StringField
 class StringField(Field):
 	def __init__(self, name=None, primary_key=False, default=None,ddl='varchar(100)'):
 		super().__init__(name,ddl,primary_key,default)
+# bool
+class BooleanField(Field):
+	def __init__(self, name=None, default=False):
+		super().__init__(name,'boolean', False,default)
+# int
+class IntegerField(Field):
+	def __init__(self, name=None, primary_key=False, default=0):
+		super().__init__(name, 'bigint', primary_key, default)
+# float
+class FloatField(Field):
+	def __init__(self, name=None, primary_key=False, default=0.0):
+		super().__init__(name, 'real', primary_key, default)
+# text
+class TextField(Field):
+	def __init__(self, name=None, default=None):
+		super().__init__(name, 'text', False, default)
 
 # 映射信息
 class ModelMetaclass(type):
@@ -112,8 +143,6 @@ class ModelMetaclass(type):
         attrs['__delete__'] = 'delete from `%s` where `%s`=?' % (tableName, primaryKey)
         return type.__new__(cls, name, bases, attrs)
 
-
-
 # 定义所有ORM映射的基类Model
 # 继承dict，实现__getattr__和__setattr__方法可以直接↓
 # >>> user['id']
@@ -147,6 +176,45 @@ class Model(dict, metaclass=ModelMetaclass):
 		return value
 
 	@classmethod
+	async def findAll(cls, where=None, args=None, **kw):
+		' find objects by where clause. '
+		sql = [cls.__select__]
+		if where:
+			sql.append('where')
+			sql.append(where)
+		if args is None:
+			args = []
+		orderBy = kw.get('orderBy', None)
+		if orderBy:
+			sql.append('order by')
+			sql.append(orderBy)
+		limit = kw.get('limit',None)
+		if limit is not None:
+			sql.append('limit')
+			if isinstance(limit,int):
+				sql.append('?')
+				args.append(limit)
+			elif isinstance(limit,tuple) and len(limit) == 2:
+				sql.append('?','?')
+				args.extend(limit)
+			else:
+				raise ValueError('Invalid limit value: %s' % str(limit))
+		rs = await select(' '.join(sql),args)
+		return [cls(**r) for r in rs]
+
+	@classmethod
+	async def findNumber(cls, selectField, where=None, args=None):
+		' find number by select and where.'
+		sql = ['select %s _num_ from `%s`' % (selectField, cls.__table__)]
+		if where:
+			sql.append('where')
+			sql.append(where)
+		rs = await select(' '.join(sql), args, 1)
+		if len(rs) == 0:
+			return None
+		return rs[0]['_num_']
+
+	@classmethod
 	async def find(cls, pk):
 		' find object by primary key. ' 
 		rs = await select('%s where `%s`=?' %(cls.__select__, cls.__primary_key__),[pk], 1)
@@ -163,6 +231,20 @@ class Model(dict, metaclass=ModelMetaclass):
 	#把一个User实例存入数据库
 	# user = User(id=123, name='Michael')
 	# yield from user.save()
+
+	async def update(self):
+		args = list(map(self.getValue, self.__fields__))
+		args.append(self.getValue(self.__primary_key__))
+		rows = await execute(self.__update__, args)
+		if rows != 1:
+			logging.warn('failed to update by primary key: affected rows: %s' % rows)
+
+	async def remove(self):
+		args = [self.getValue(self.__primary_key__)]
+		rows = await execute(self.__delete__, args)
+		if rows != 1:
+			logging.warn('failed to remove by primary key: affected rows: %s' % rows)
+
 
 class User(Model):
 	__table__ = 'users'
